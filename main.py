@@ -5,7 +5,9 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote
 
 from loguru import logger
 from tqdm import tqdm
@@ -17,6 +19,34 @@ app = typer.Typer(
     add_completion=False,
     help="Scan GitHub Actions workflow files for external uses targets.",
 )
+
+SCAN_COLUMNS = [
+    "repo",
+    "repo_updated_at",
+    "repo_pushed_at",
+    "workflow_path",
+    "uses_target",
+    "uses_repo",
+    "uses_path",
+    "ref",
+]
+
+INSPECT_COLUMNS = [
+    "uses_repo",
+    "uses_path",
+    "ref",
+    "metadata_path",
+    "metadata_found",
+    "runs_using",
+    "problem",
+]
+
+PROBLEM_REPORT_COLUMNS = [
+    *SCAN_COLUMNS,
+    "metadata_path",
+    "runs_using",
+    "problem",
+]
 
 
 @dataclass(frozen=True)
@@ -41,6 +71,24 @@ class UseRecord:
     uses_repo: str
     uses_path: str
     ref: str
+
+
+@dataclass(frozen=True)
+class ActionKey:
+    uses_repo: str
+    uses_path: str
+    ref: str
+
+
+@dataclass(frozen=True)
+class ActionMetadataRecord:
+    uses_repo: str
+    uses_path: str
+    ref: str
+    metadata_path: str
+    metadata_found: bool
+    runs_using: str
+    problem: str
 
 
 class GitHubClient:
@@ -88,6 +136,14 @@ def require_gh() -> None:
         raise typer.BadParameter("missing required command: gh") from None
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise typer.BadParameter(f"could not run gh: {exc}") from exc
+
+
+def setup_logging(progress: bool, log_level: str) -> None:
+    logger.remove()
+    if progress:
+        logger.add(sys.stderr, level=log_level.upper(), colorize=True)
+    else:
+        logger.disable(__name__)
 
 
 def list_repos(client: GitHubClient, org: str, limit: int) -> list[Repo]:
@@ -239,22 +295,31 @@ def scan(
     if progress:
         logger.info("found {} repositories", len(repos))
 
+    progress_bar: tqdm[Repo] | None = None
     repo_iterable: Iterable[Repo]
     if progress:
-        repo_iterable = tqdm(
+        progress_bar = tqdm(
             repos,
             desc="repositories",
             unit="repo",
             file=sys.stderr,
             dynamic_ncols=True,
         )
+        progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
+        repo_iterable = progress_bar
     else:
         repo_iterable = repos
 
     for repo in repo_iterable:
+        if progress_bar:
+            progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
+
         if progress:
             logger.debug("listing workflow files for {}", repo.name_with_owner)
         workflow_files = list_workflow_files(client, repo)
+        if progress_bar:
+            progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
+
         if progress and workflow_files:
             logger.debug(
                 "found {} workflow files in {}",
@@ -271,26 +336,14 @@ def scan(
                 )
 
             text = get_workflow_text(client, repo, workflow_file)
+            if progress_bar:
+                progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
             yield from parse_workflow(text, repo, workflow_file, org)
 
 
-def write_tsv(records: Iterable[UseRecord], include_header: bool) -> None:
-    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
-    if include_header:
-        writer.writerow(
-            [
-                "repo",
-                "repo_updated_at",
-                "repo_pushed_at",
-                "workflow_path",
-                "uses_target",
-                "uses_repo",
-                "uses_path",
-                "ref",
-            ]
-        )
-
+def dedupe_scan_records(records: Iterable[UseRecord]) -> list[UseRecord]:
     seen: set[tuple[str, str, str, str, str, str, str, str]] = set()
+    deduped: list[UseRecord] = []
     for record in records:
         row = (
             record.repo,
@@ -305,11 +358,348 @@ def write_tsv(records: Iterable[UseRecord], include_header: bool) -> None:
         if row in seen:
             continue
         seen.add(row)
-        writer.writerow(row)
+        deduped.append(record)
+    return deduped
 
 
-@app.command()
-def main(
+def action_keys_from_records(records: Iterable[UseRecord]) -> list[ActionKey]:
+    keys = {
+        ActionKey(
+            uses_repo=record.uses_repo,
+            uses_path=record.uses_path,
+            ref=record.ref,
+        )
+        for record in records
+        if record.uses_repo and record.ref
+    }
+    return sorted(keys, key=lambda key: (key.uses_repo.lower(), key.uses_path, key.ref))
+
+
+def write_scan_tsv(records: Iterable[UseRecord], include_header: bool) -> None:
+    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+    if include_header:
+        writer.writerow(SCAN_COLUMNS)
+
+    for record in dedupe_scan_records(records):
+        writer.writerow(
+            [
+                record.repo,
+                record.repo_updated_at,
+                record.repo_pushed_at,
+                record.workflow_path,
+                record.uses_target,
+                record.uses_repo,
+                record.uses_path,
+                record.ref,
+            ]
+        )
+
+
+def scan_record_to_row(record: UseRecord) -> dict[str, str]:
+    return {
+        "repo": record.repo,
+        "repo_updated_at": record.repo_updated_at,
+        "repo_pushed_at": record.repo_pushed_at,
+        "workflow_path": record.workflow_path,
+        "uses_target": record.uses_target,
+        "uses_repo": record.uses_repo,
+        "uses_path": record.uses_path,
+        "ref": record.ref,
+    }
+
+
+def metadata_records_by_key(
+    records: Iterable[ActionMetadataRecord],
+) -> dict[ActionKey, ActionMetadataRecord]:
+    return {
+        ActionKey(
+            uses_repo=record.uses_repo,
+            uses_path=record.uses_path,
+            ref=record.ref,
+        ): record
+        for record in records
+    }
+
+
+def write_problem_report_from_records(
+    scan_records: Iterable[UseRecord],
+    metadata_by_key: dict[ActionKey, ActionMetadataRecord],
+    include_header: bool,
+) -> None:
+    writer = csv.DictWriter(
+        sys.stdout,
+        fieldnames=PROBLEM_REPORT_COLUMNS,
+        delimiter="\t",
+        lineterminator="\n",
+        extrasaction="ignore",
+    )
+    if include_header:
+        writer.writeheader()
+
+    for record in scan_records:
+        key = ActionKey(
+            uses_repo=record.uses_repo,
+            uses_path=record.uses_path,
+            ref=record.ref,
+        )
+        metadata = metadata_by_key.get(key)
+        if not metadata or not metadata.problem:
+            continue
+
+        writer.writerow(
+            {
+                **scan_record_to_row(record),
+                "metadata_path": metadata.metadata_path,
+                "runs_using": metadata.runs_using,
+                "problem": metadata.problem,
+            }
+        )
+
+
+def read_action_keys(path: Path) -> list[ActionKey]:
+    keys: set[ActionKey] = set()
+    with path.open(newline="") as stream:
+        reader = csv.reader(stream, delimiter="\t")
+        first_row = next(reader, None)
+        if first_row is None:
+            return []
+
+        if "uses_repo" in first_row and "ref" in first_row:
+            dict_reader = csv.DictReader(stream, fieldnames=first_row, delimiter="\t")
+            for row in dict_reader:
+                uses_repo = row.get("uses_repo", "")
+                ref = row.get("ref", "")
+                if uses_repo and ref:
+                    keys.add(
+                        ActionKey(
+                            uses_repo=uses_repo,
+                            uses_path=row.get("uses_path", ""),
+                            ref=ref,
+                        )
+                    )
+        else:
+            rows = [first_row, *reader]
+            for row in rows:
+                if len(row) < 4:
+                    continue
+                uses_target = row[2]
+                ref = row[3]
+                uses_repo, uses_path = action_repo_and_path_from_uses(uses_target)
+                if uses_repo and ref:
+                    keys.add(ActionKey(uses_repo=uses_repo, uses_path=uses_path, ref=ref))
+
+    return sorted(keys, key=lambda key: (key.uses_repo.lower(), key.uses_path, key.ref))
+
+
+def scan_rows(path: Path) -> Iterable[dict[str, str]]:
+    with path.open(newline="") as stream:
+        reader = csv.reader(stream, delimiter="\t")
+        first_row = next(reader, None)
+        if first_row is None:
+            return
+
+        if "uses_repo" in first_row and "ref" in first_row:
+            yield from csv.DictReader(stream, fieldnames=first_row, delimiter="\t")
+            return
+
+        rows = [first_row, *reader]
+        for row in rows:
+            if len(row) < 4:
+                continue
+            uses_target = row[2]
+            uses_repo, uses_path = action_repo_and_path_from_uses(uses_target)
+            yield {
+                "repo": row[0],
+                "repo_updated_at": "",
+                "repo_pushed_at": "",
+                "workflow_path": row[1],
+                "uses_target": uses_target,
+                "uses_repo": uses_repo,
+                "uses_path": uses_path,
+                "ref": row[3],
+            }
+
+
+def inspect_rows_by_key(path: Path) -> dict[ActionKey, dict[str, str]]:
+    rows_by_key: dict[ActionKey, dict[str, str]] = {}
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        for row in reader:
+            problem = row.get("problem", "")
+            if not problem:
+                continue
+            key = ActionKey(
+                uses_repo=row.get("uses_repo", ""),
+                uses_path=row.get("uses_path", ""),
+                ref=row.get("ref", ""),
+            )
+            if key.uses_repo and key.ref:
+                rows_by_key[key] = row
+
+    return rows_by_key
+
+
+def action_metadata_paths(key: ActionKey) -> list[str]:
+    base = key.uses_path.rstrip("/")
+    if base:
+        return [f"{base}/action.yml", f"{base}/action.yaml"]
+    return ["action.yml", "action.yaml"]
+
+
+def fetch_action_metadata(
+    client: GitHubClient, key: ActionKey
+) -> tuple[str, dict[str, Any] | None, str]:
+    quoted_ref = quote(key.ref, safe="")
+    for metadata_path in action_metadata_paths(key):
+        result = client.api(
+            f"/repos/{key.uses_repo}/contents/{metadata_path}?ref={quoted_ref}",
+            "-H",
+            "Accept: application/vnd.github.raw",
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+
+        try:
+            parsed = yaml.safe_load(result.stdout)
+        except yaml.YAMLError as exc:
+            return metadata_path, None, f"metadata_parse_error:{exc}"
+
+        if isinstance(parsed, dict):
+            return metadata_path, parsed, ""
+        return metadata_path, None, "metadata_not_mapping"
+
+    return "", None, "metadata_missing"
+
+
+def classify_runtime(runs_using: str, metadata_problem: str) -> str:
+    if metadata_problem:
+        return metadata_problem
+    runtime = runs_using.lower()
+    if runtime.startswith("node"):
+        version = runtime.removeprefix("node")
+        if version.isdigit() and int(version) < 24:
+            return "node_lt_24"
+    return ""
+
+
+def inspect_action(
+    client: GitHubClient,
+    key: ActionKey,
+) -> ActionMetadataRecord:
+    metadata_path, metadata, metadata_problem = fetch_action_metadata(client, key)
+    runs_using = ""
+    if metadata:
+        runs = metadata.get("runs")
+        if isinstance(runs, dict) and isinstance(runs.get("using"), str):
+            runs_using = runs["using"]
+
+    problem = classify_runtime(runs_using, metadata_problem)
+    if metadata and not runs_using:
+        problem = "runs_using_missing"
+
+    return ActionMetadataRecord(
+        uses_repo=key.uses_repo,
+        uses_path=key.uses_path,
+        ref=key.ref,
+        metadata_path=metadata_path,
+        metadata_found=metadata is not None,
+        runs_using=runs_using,
+        problem=problem,
+    )
+
+
+def inspect_actions(
+    client: GitHubClient,
+    keys: list[ActionKey],
+    progress: bool,
+) -> Iterable[ActionMetadataRecord]:
+    if progress:
+        logger.info("inspecting {} unique action refs", len(keys))
+
+    progress_bar: tqdm[ActionKey] | None = None
+    key_iterable: Iterable[ActionKey]
+    if progress:
+        progress_bar = tqdm(
+            keys,
+            desc="actions",
+            unit="action",
+            file=sys.stderr,
+            dynamic_ncols=True,
+        )
+        progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
+        key_iterable = progress_bar
+    else:
+        key_iterable = keys
+
+    for key in key_iterable:
+        if progress_bar:
+            progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
+        logger.debug("inspecting {}{}@{}", key.uses_repo, f'/{key.uses_path}' if key.uses_path else "", key.ref)
+        record = inspect_action(client, key)
+        if progress_bar:
+            progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
+        yield record
+
+
+def write_inspect_tsv(
+    records: Iterable[ActionMetadataRecord], include_header: bool
+) -> None:
+    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+    if include_header:
+        writer.writerow(INSPECT_COLUMNS)
+
+    for record in records:
+        writer.writerow(
+            [
+                record.uses_repo,
+                record.uses_path,
+                record.ref,
+                record.metadata_path,
+                str(record.metadata_found).lower(),
+                record.runs_using,
+                record.problem,
+            ]
+        )
+
+
+def write_problem_report(
+    uses_tsv: Path,
+    action_metadata_tsv: Path,
+    include_header: bool,
+) -> None:
+    problems = inspect_rows_by_key(action_metadata_tsv)
+    writer = csv.DictWriter(
+        sys.stdout,
+        fieldnames=PROBLEM_REPORT_COLUMNS,
+        delimiter="\t",
+        lineterminator="\n",
+        extrasaction="ignore",
+    )
+    if include_header:
+        writer.writeheader()
+
+    for row in scan_rows(uses_tsv):
+        key = ActionKey(
+            uses_repo=row.get("uses_repo", ""),
+            uses_path=row.get("uses_path", ""),
+            ref=row.get("ref", ""),
+        )
+        problem = problems.get(key)
+        if not problem:
+            continue
+
+        report_row = {
+            **row,
+            "metadata_path": problem.get("metadata_path", ""),
+            "runs_using": problem.get("runs_using", ""),
+            "problem": problem.get("problem", ""),
+        }
+        writer.writerow(report_row)
+
+
+@app.command("scan")
+def scan_command(
     org: str = typer.Argument(..., help="GitHub organization to scan."),
     repo_limit: int = typer.Option(
         1000,
@@ -349,17 +739,137 @@ def main(
         typer.echo("  GET /repos/{owner}/{repo}/contents/{workflow_path}")
         return
 
-    logger.remove()
-    if progress:
-        logger.add(sys.stderr, level=log_level.upper(), colorize=True)
-    else:
-        logger.disable(__name__)
-
+    setup_logging(progress, log_level)
     require_gh()
     client = GitHubClient()
     try:
         records = scan(client, org, repo_limit, progress)
-        write_tsv(records, include_header=header)
+        write_scan_tsv(records, include_header=header)
+    finally:
+        if progress:
+            logger.info("gh api calls: {}", client.api_call_count)
+
+
+@app.command("inspect-actions")
+def inspect_actions_command(
+    input_tsv: Path = typer.Argument(..., help="TSV produced by scan."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Read and deduplicate action refs without calling GitHub.",
+    ),
+    progress: bool = typer.Option(
+        True,
+        "--progress/--no-progress",
+        help="Write progress logs to stderr.",
+    ),
+    log_level: str = typer.Option(
+        "INFO",
+        "--log-level",
+        help="Log level for stderr progress logs.",
+    ),
+    header: bool = typer.Option(
+        True,
+        "--header/--no-header",
+        help="Include a TSV header row.",
+    ),
+) -> None:
+    keys = read_action_keys(input_tsv)
+    if dry_run:
+        typer.echo(f"input_tsv: {input_tsv}")
+        typer.echo(f"unique_action_refs: {len(keys)}")
+        typer.echo("planned endpoints:")
+        typer.echo("  GET /repos/{uses_repo}/contents/{uses_path}/action.yml?ref={ref}")
+        typer.echo("  GET /repos/{uses_repo}/contents/{uses_path}/action.yaml?ref={ref}")
+        return
+
+    setup_logging(progress, log_level)
+    require_gh()
+    client = GitHubClient()
+    try:
+        records = inspect_actions(client, keys, progress)
+        write_inspect_tsv(records, include_header=header)
+    finally:
+        if progress:
+            logger.info("gh api calls: {}", client.api_call_count)
+
+
+@app.command("problem-report")
+def problem_report_command(
+    uses_tsv: Path = typer.Argument(..., help="TSV produced by scan."),
+    action_metadata_tsv: Path = typer.Argument(
+        ..., help="TSV produced by inspect-actions."
+    ),
+    header: bool = typer.Option(
+        True,
+        "--header/--no-header",
+        help="Include a TSV header row.",
+    ),
+) -> None:
+    write_problem_report(uses_tsv, action_metadata_tsv, include_header=header)
+
+
+@app.command("audit")
+def audit_command(
+    org: str = typer.Argument(..., help="GitHub organization to scan."),
+    repo_limit: int = typer.Option(
+        1000,
+        "--repo-limit",
+        envvar="REPO_LIMIT",
+        help="Maximum number of repositories to scan.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the planned audit configuration without calling GitHub.",
+    ),
+    progress: bool = typer.Option(
+        True,
+        "--progress/--no-progress",
+        help="Write progress logs to stderr.",
+    ),
+    log_level: str = typer.Option(
+        "INFO",
+        "--log-level",
+        help="Log level for stderr progress logs.",
+    ),
+    header: bool = typer.Option(
+        True,
+        "--header/--no-header",
+        help="Include a TSV header row.",
+    ),
+) -> None:
+    if dry_run:
+        typer.echo(f"organization: {org}")
+        typer.echo(f"repo_limit: {repo_limit}")
+        typer.echo(f"progress: {progress}")
+        typer.echo(f"log_level: {log_level.upper()}")
+        typer.echo("planned steps:")
+        typer.echo("  scan workflows")
+        typer.echo("  deduplicate action refs")
+        typer.echo("  inspect action metadata")
+        typer.echo("  write problem report")
+        return
+
+    setup_logging(progress, log_level)
+    require_gh()
+    client = GitHubClient()
+    try:
+        scan_records = dedupe_scan_records(scan(client, org, repo_limit, progress))
+        keys = action_keys_from_records(scan_records)
+        if progress:
+            logger.info(
+                "found {} unique action refs across {} uses rows",
+                len(keys),
+                len(scan_records),
+            )
+        metadata_records = list(inspect_actions(client, keys, progress))
+        metadata_by_key = metadata_records_by_key(metadata_records)
+        write_problem_report_from_records(
+            scan_records,
+            metadata_by_key,
+            include_header=header,
+        )
     finally:
         if progress:
             logger.info("gh api calls: {}", client.api_call_count)
