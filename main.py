@@ -5,7 +5,6 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote
 
@@ -17,7 +16,7 @@ import yaml
 
 app = typer.Typer(
     add_completion=False,
-    help="Scan GitHub Actions workflow files for external uses targets.",
+    help="Scan GitHub Actions workflow files and report actions using old Node runtimes.",
 )
 
 SCAN_COLUMNS = [
@@ -29,16 +28,6 @@ SCAN_COLUMNS = [
     "uses_repo",
     "uses_path",
     "ref",
-]
-
-INSPECT_COLUMNS = [
-    "uses_repo",
-    "uses_path",
-    "ref",
-    "metadata_path",
-    "metadata_found",
-    "runs_using",
-    "problem",
 ]
 
 PROBLEM_REPORT_COLUMNS = [
@@ -168,7 +157,7 @@ def list_repos(client: GitHubClient, org: str, limit: int) -> list[Repo]:
                 "-f",
                 f"page={page}",
                 "--jq",
-                '.[] | {name, owner: .owner.login, updated_at, pushed_at} | @json',
+                ".[] | {name, owner: .owner.login, updated_at, pushed_at} | @json",
             )
         )
 
@@ -208,7 +197,9 @@ def list_workflow_files(client: GitHubClient, repo: Repo) -> list[WorkflowFile]:
     ]
 
 
-def get_workflow_text(client: GitHubClient, repo: Repo, workflow_file: WorkflowFile) -> str:
+def get_workflow_text(
+    client: GitHubClient, repo: Repo, workflow_file: WorkflowFile
+) -> str:
     return client.api_text(
         f"/repos/{repo.name_with_owner}/contents/{workflow_file.path}",
         "-H",
@@ -375,26 +366,6 @@ def action_keys_from_records(records: Iterable[UseRecord]) -> list[ActionKey]:
     return sorted(keys, key=lambda key: (key.uses_repo.lower(), key.uses_path, key.ref))
 
 
-def write_scan_tsv(records: Iterable[UseRecord], include_header: bool) -> None:
-    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
-    if include_header:
-        writer.writerow(SCAN_COLUMNS)
-
-    for record in dedupe_scan_records(records):
-        writer.writerow(
-            [
-                record.repo,
-                record.repo_updated_at,
-                record.repo_pushed_at,
-                record.workflow_path,
-                record.uses_target,
-                record.uses_repo,
-                record.uses_path,
-                record.ref,
-            ]
-        )
-
-
 def scan_record_to_row(record: UseRecord) -> dict[str, str]:
     return {
         "repo": record.repo,
@@ -454,89 +425,6 @@ def write_problem_report_from_records(
                 "problem": metadata.problem,
             }
         )
-
-
-def read_action_keys(path: Path) -> list[ActionKey]:
-    keys: set[ActionKey] = set()
-    with path.open(newline="") as stream:
-        reader = csv.reader(stream, delimiter="\t")
-        first_row = next(reader, None)
-        if first_row is None:
-            return []
-
-        if "uses_repo" in first_row and "ref" in first_row:
-            dict_reader = csv.DictReader(stream, fieldnames=first_row, delimiter="\t")
-            for row in dict_reader:
-                uses_repo = row.get("uses_repo", "")
-                ref = row.get("ref", "")
-                if uses_repo and ref:
-                    keys.add(
-                        ActionKey(
-                            uses_repo=uses_repo,
-                            uses_path=row.get("uses_path", ""),
-                            ref=ref,
-                        )
-                    )
-        else:
-            rows = [first_row, *reader]
-            for row in rows:
-                if len(row) < 4:
-                    continue
-                uses_target = row[2]
-                ref = row[3]
-                uses_repo, uses_path = action_repo_and_path_from_uses(uses_target)
-                if uses_repo and ref:
-                    keys.add(ActionKey(uses_repo=uses_repo, uses_path=uses_path, ref=ref))
-
-    return sorted(keys, key=lambda key: (key.uses_repo.lower(), key.uses_path, key.ref))
-
-
-def scan_rows(path: Path) -> Iterable[dict[str, str]]:
-    with path.open(newline="") as stream:
-        reader = csv.reader(stream, delimiter="\t")
-        first_row = next(reader, None)
-        if first_row is None:
-            return
-
-        if "uses_repo" in first_row and "ref" in first_row:
-            yield from csv.DictReader(stream, fieldnames=first_row, delimiter="\t")
-            return
-
-        rows = [first_row, *reader]
-        for row in rows:
-            if len(row) < 4:
-                continue
-            uses_target = row[2]
-            uses_repo, uses_path = action_repo_and_path_from_uses(uses_target)
-            yield {
-                "repo": row[0],
-                "repo_updated_at": "",
-                "repo_pushed_at": "",
-                "workflow_path": row[1],
-                "uses_target": uses_target,
-                "uses_repo": uses_repo,
-                "uses_path": uses_path,
-                "ref": row[3],
-            }
-
-
-def inspect_rows_by_key(path: Path) -> dict[ActionKey, dict[str, str]]:
-    rows_by_key: dict[ActionKey, dict[str, str]] = {}
-    with path.open(newline="") as stream:
-        reader = csv.DictReader(stream, delimiter="\t")
-        for row in reader:
-            problem = row.get("problem", "")
-            if not problem:
-                continue
-            key = ActionKey(
-                uses_repo=row.get("uses_repo", ""),
-                uses_path=row.get("uses_path", ""),
-                ref=row.get("ref", ""),
-            )
-            if key.uses_repo and key.ref:
-                rows_by_key[key] = row
-
-    return rows_by_key
 
 
 def action_metadata_paths(key: ActionKey) -> list[str]:
@@ -635,182 +523,20 @@ def inspect_actions(
     for key in key_iterable:
         if progress_bar:
             progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
-        logger.debug("inspecting {}{}@{}", key.uses_repo, f'/{key.uses_path}' if key.uses_path else "", key.ref)
+        logger.debug(
+            "inspecting {}{}@{}",
+            key.uses_repo,
+            f"/{key.uses_path}" if key.uses_path else "",
+            key.ref,
+        )
         record = inspect_action(client, key)
         if progress_bar:
             progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
         yield record
 
 
-def write_inspect_tsv(
-    records: Iterable[ActionMetadataRecord], include_header: bool
-) -> None:
-    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
-    if include_header:
-        writer.writerow(INSPECT_COLUMNS)
-
-    for record in records:
-        writer.writerow(
-            [
-                record.uses_repo,
-                record.uses_path,
-                record.ref,
-                record.metadata_path,
-                str(record.metadata_found).lower(),
-                record.runs_using,
-                record.problem,
-            ]
-        )
-
-
-def write_problem_report(
-    uses_tsv: Path,
-    action_metadata_tsv: Path,
-    include_header: bool,
-) -> None:
-    problems = inspect_rows_by_key(action_metadata_tsv)
-    writer = csv.DictWriter(
-        sys.stdout,
-        fieldnames=PROBLEM_REPORT_COLUMNS,
-        delimiter="\t",
-        lineterminator="\n",
-        extrasaction="ignore",
-    )
-    if include_header:
-        writer.writeheader()
-
-    for row in scan_rows(uses_tsv):
-        key = ActionKey(
-            uses_repo=row.get("uses_repo", ""),
-            uses_path=row.get("uses_path", ""),
-            ref=row.get("ref", ""),
-        )
-        problem = problems.get(key)
-        if not problem:
-            continue
-
-        report_row = {
-            **row,
-            "metadata_path": problem.get("metadata_path", ""),
-            "runs_using": problem.get("runs_using", ""),
-            "problem": problem.get("problem", ""),
-        }
-        writer.writerow(report_row)
-
-
-@app.command("scan")
-def scan_command(
-    org: str = typer.Argument(..., help="GitHub organization to scan."),
-    repo_limit: int = typer.Option(
-        1000,
-        "--repo-limit",
-        envvar="REPO_LIMIT",
-        help="Maximum number of repositories to scan.",
-    ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Print the planned scan configuration without calling GitHub.",
-    ),
-    progress: bool = typer.Option(
-        True,
-        "--progress/--no-progress",
-        help="Write progress logs to stderr.",
-    ),
-    log_level: str = typer.Option(
-        "INFO",
-        "--log-level",
-        help="Log level for stderr progress logs.",
-    ),
-    header: bool = typer.Option(
-        False,
-        "--header/--no-header",
-        help="Include a TSV header row.",
-    ),
-) -> None:
-    if dry_run:
-        typer.echo(f"organization: {org}")
-        typer.echo(f"repo_limit: {repo_limit}")
-        typer.echo(f"progress: {progress}")
-        typer.echo(f"log_level: {log_level.upper()}")
-        typer.echo("planned endpoints:")
-        typer.echo(f"  GET /orgs/{org}/repos")
-        typer.echo("  GET /repos/{owner}/{repo}/contents/.github/workflows")
-        typer.echo("  GET /repos/{owner}/{repo}/contents/{workflow_path}")
-        return
-
-    setup_logging(progress, log_level)
-    require_gh()
-    client = GitHubClient()
-    try:
-        records = scan(client, org, repo_limit, progress)
-        write_scan_tsv(records, include_header=header)
-    finally:
-        if progress:
-            logger.info("gh api calls: {}", client.api_call_count)
-
-
-@app.command("inspect-actions")
-def inspect_actions_command(
-    input_tsv: Path = typer.Argument(..., help="TSV produced by scan."),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Read and deduplicate action refs without calling GitHub.",
-    ),
-    progress: bool = typer.Option(
-        True,
-        "--progress/--no-progress",
-        help="Write progress logs to stderr.",
-    ),
-    log_level: str = typer.Option(
-        "INFO",
-        "--log-level",
-        help="Log level for stderr progress logs.",
-    ),
-    header: bool = typer.Option(
-        True,
-        "--header/--no-header",
-        help="Include a TSV header row.",
-    ),
-) -> None:
-    keys = read_action_keys(input_tsv)
-    if dry_run:
-        typer.echo(f"input_tsv: {input_tsv}")
-        typer.echo(f"unique_action_refs: {len(keys)}")
-        typer.echo("planned endpoints:")
-        typer.echo("  GET /repos/{uses_repo}/contents/{uses_path}/action.yml?ref={ref}")
-        typer.echo("  GET /repos/{uses_repo}/contents/{uses_path}/action.yaml?ref={ref}")
-        return
-
-    setup_logging(progress, log_level)
-    require_gh()
-    client = GitHubClient()
-    try:
-        records = inspect_actions(client, keys, progress)
-        write_inspect_tsv(records, include_header=header)
-    finally:
-        if progress:
-            logger.info("gh api calls: {}", client.api_call_count)
-
-
-@app.command("problem-report")
-def problem_report_command(
-    uses_tsv: Path = typer.Argument(..., help="TSV produced by scan."),
-    action_metadata_tsv: Path = typer.Argument(
-        ..., help="TSV produced by inspect-actions."
-    ),
-    header: bool = typer.Option(
-        True,
-        "--header/--no-header",
-        help="Include a TSV header row.",
-    ),
-) -> None:
-    write_problem_report(uses_tsv, action_metadata_tsv, include_header=header)
-
-
-@app.command("audit")
-def audit_command(
+@app.command()
+def main(
     org: str = typer.Argument(..., help="GitHub organization to scan."),
     repo_limit: int = typer.Option(
         1000,
