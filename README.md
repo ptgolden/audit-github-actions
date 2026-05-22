@@ -1,10 +1,15 @@
 # github-actions-scan
 
-Scan every repository in a GitHub organization for workflow files that pin
-external GitHub Actions, then audit each unique action ref against a set of
-checks. Writes a TSV problem report (one row per workflow use × problem) to
-stdout. Today the only check flags JavaScript actions running on Node older
-than version 24.
+Two subcommands for working with GitHub Actions across repositories:
+
+- `org` — scan every repository in an organization for workflow files that pin
+  external GitHub Actions, then audit each unique action ref against a set of
+  checks. Writes a TSV problem report (one row per workflow use × problem) to
+  stdout. Today the only check flags JavaScript actions running on Node older
+  than version 24.
+- `repo` — scan a single repository's workflows and look up the latest release
+  for every external action they use. Writes a TSV update report (one row per
+  workflow use, with current ref and latest release info) to stdout.
 
 ## Requirements
 
@@ -15,18 +20,22 @@ than version 24.
 ## Run
 
 ```sh
-uv run github-actions-scan ORG > report.tsv
+uv run github-actions-scan org ORG > report.tsv
+uv run github-actions-scan repo OWNER/REPO > updates.tsv
 ```
 
-(Or equivalently `uv run python -m github_actions_scan ORG`.)
+(Or equivalently `uv run python -m github_actions_scan ...`.)
 
-Useful flags:
+Flags common to both commands:
 
-- `--repo-limit N` (or `REPO_LIMIT=N`) cap how many repos to scan
 - `--dry-run` print the planned configuration without calling GitHub
 - `--no-progress` suppress stderr progress logs and the tqdm bar
 - `--no-header` omit the TSV header row
 - `--log-level DEBUG` more verbose progress logging
+
+`org`-only flags:
+
+- `--repo-limit N` (or `REPO_LIMIT=N`) cap how many repos to scan
 
 ## Checks
 

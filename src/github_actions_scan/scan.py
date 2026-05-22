@@ -1,6 +1,6 @@
 import json
 import sys
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import yaml
 from loguru import logger
@@ -42,13 +42,22 @@ def action_repo_and_path_from_uses(uses_target: str) -> tuple[str, str]:
     return action_repo, action_path
 
 
-def should_skip(uses_target: str, org: str) -> bool:
-    """Return true for local actions and same-org actions that are out of scope."""
-    if uses_target.startswith(("./", "../")):
-        return True
+def is_local_uses(uses_target: str) -> bool:
+    """Return true for actions whose path is relative to the workflow's own repo."""
+    return uses_target.startswith(("./", "../"))
 
+
+def should_skip_external_to_org(uses_target: str, org: str) -> bool:
+    """Skip local actions and actions owned by the org being audited."""
+    if is_local_uses(uses_target):
+        return True
     owner = uses_target.split("/", 1)[0].lower()
     return owner == org.lower()
+
+
+def should_skip_local(uses_target: str) -> bool:
+    """Skip only local-to-the-workflow actions; keep everything else."""
+    return is_local_uses(uses_target)
 
 
 def list_repos(client: GitHubClient, org: str, limit: int) -> list[Repo]:
@@ -127,9 +136,12 @@ def get_workflow_text(
 
 
 def parse_workflow(
-    text: str, repo: Repo, workflow_file: WorkflowFile, org: str
+    text: str,
+    repo: Repo,
+    workflow_file: WorkflowFile,
+    skip: Callable[[str], bool],
 ) -> Iterable[UseRecord]:
-    """Parse one workflow file and yield external action uses records."""
+    """Parse one workflow file and yield action uses records matching `skip`."""
     try:
         parsed = yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -142,7 +154,7 @@ def parse_workflow(
         return
 
     for uses_target in iter_uses(parsed):
-        if should_skip(uses_target, org):
+        if skip(uses_target):
             continue
         uses_repo, uses_path = action_repo_and_path_from_uses(uses_target)
         yield UseRecord(
@@ -213,7 +225,34 @@ def scan(
             text = get_workflow_text(client, repo, workflow_file)
             if progress_bar:
                 progress_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
-            yield from parse_workflow(text, repo, workflow_file, org)
+            yield from parse_workflow(
+                text,
+                repo,
+                workflow_file,
+                lambda u: should_skip_external_to_org(u, org),
+            )
+
+
+def scan_repo_workflows(
+    client: GitHubClient,
+    repo: Repo,
+) -> Iterable[UseRecord]:
+    """Scan one repository's workflows and yield uses of non-local actions."""
+    workflow_files = list_workflow_files(client, repo)
+    logger.debug(
+        "found {} workflow files in {}",
+        len(workflow_files),
+        repo.name_with_owner,
+    )
+
+    for workflow_file in workflow_files:
+        logger.debug(
+            "downloading {}:{}",
+            repo.name_with_owner,
+            workflow_file.path,
+        )
+        text = get_workflow_text(client, repo, workflow_file)
+        yield from parse_workflow(text, repo, workflow_file, should_skip_local)
 
 
 def dedupe_scan_records(records: Iterable[UseRecord]) -> list[UseRecord]:

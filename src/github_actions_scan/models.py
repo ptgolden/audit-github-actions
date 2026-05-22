@@ -19,6 +19,18 @@ PROBLEM_REPORT_COLUMNS = [
     "detail",
 ]
 
+UPDATE_REPORT_COLUMNS = [
+    "workflow_path",
+    "uses_target",
+    "uses_repo",
+    "uses_path",
+    "current_ref",
+    "latest_tag",
+    "latest_published_at",
+    "latest_url",
+    "status",
+]
+
 
 @dataclass(frozen=True)
 class Repo:
@@ -65,3 +77,22 @@ class ActionMetadataRecord:
     metadata_path: str
     metadata_found: bool
     problems: tuple[ProblemRecord, ...]
+
+
+@dataclass(frozen=True)
+class LatestRelease:
+    tag_name: str
+    name: str
+    published_at: str
+    html_url: str
+
+
+@dataclass(frozen=True)
+class ActionUpdate:
+    workflow_path: str
+    uses_target: str
+    uses_repo: str
+    uses_path: str
+    current_ref: str
+    latest_release: LatestRelease | None
+    status: str
