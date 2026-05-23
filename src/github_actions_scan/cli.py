@@ -7,8 +7,10 @@ from loguru import logger
 
 from .actions import action_keys_from_records, inspect_actions, metadata_records_by_key
 from .clone import ensure_clone, resolve_here, working_tree_is_dirty
+from .editor import apply_decisions, diff
 from .github import GitHubClient, require_gh
 from .models import Repo
+from .prompts import prompt_for_decisions
 from .report import write_problem_report_from_records
 from .scan import dedupe_scan_records, scan, scan_cloned_workflows, scan_repo_workflows
 from .update import find_action_updates, write_update_report
@@ -203,16 +205,13 @@ def update_command(
         "--log-level",
         help="Log level for stderr progress logs.",
     ),
-    header: bool = typer.Option(
-        True,
-        "--header/--no-header",
-        help="Include a TSV header row.",
-    ),
 ) -> None:
     """Interactively update GitHub Actions used in REPO's workflows.
 
-    Phase 1: sparse-clones (or uses cwd) and emits the same TSV as `repo`.
-    Interactive editing and PR creation land in later phases.
+    Sparse-clones the target (or uses cwd with --here), looks up the latest
+    release for each external action, and walks you through every outdated
+    use with `git add -p`-style prompts. Edits are written back to the
+    workflow files; review with `git diff` afterward.
     """
     setup_logging(progress, log_level)
 
@@ -244,7 +243,9 @@ def update_command(
         typer.echo("  scan local workflows")
         typer.echo("  fetch latest release per action repo")
         typer.echo("  resolve current ref commit info per (repo, ref)")
-        typer.echo("  write update report")
+        typer.echo("  prompt interactively for each outdated action")
+        typer.echo("  apply decisions to workflow files")
+        typer.echo("  show diff")
         return
 
     require_gh()
@@ -254,7 +255,19 @@ def update_command(
         updates = find_action_updates(client, records, progress)
         if progress:
             logger.info("computed {} action update rows", len(updates))
-        write_update_report(updates, include_header=header)
+
+        decisions = prompt_for_decisions(clone_path, updates)
+        if not decisions:
+            logger.info("no decisions made; nothing to apply")
+            return
+
+        edits = apply_decisions(clone_path, decisions, updates)
+        if edits == 0:
+            logger.info("no edits applied")
+            return
+
+        print()
+        print(diff(clone_path))
     finally:
         if progress:
             logger.info("gh api calls: {}", client.api_call_count)
