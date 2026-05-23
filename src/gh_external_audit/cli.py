@@ -42,7 +42,7 @@ def setup_logging(progress: bool, log_level: str) -> None:
     if progress:
         logger.add(sys.stderr, level=log_level.upper(), colorize=True)
     else:
-        logger.disable("github_actions_scan")
+        logger.disable("gh_external_audit")
 
 
 @app.command(name="org")

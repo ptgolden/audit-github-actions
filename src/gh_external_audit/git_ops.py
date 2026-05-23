@@ -132,7 +132,7 @@ def build_pr_body(
     if not bullets:
         return "(no changes)"
     return (
-        "Updates from `github-actions-scan update`:\n\n"
+        "Updates from `gh-external-audit update`:\n\n"
         + "\n".join(bullets)
     )
 

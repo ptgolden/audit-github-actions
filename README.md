@@ -1,4 +1,4 @@
-# github-actions-scan
+# gh-external-audit
 
 Two subcommands for working with GitHub Actions across repositories:
 
@@ -20,11 +20,11 @@ Two subcommands for working with GitHub Actions across repositories:
 ## Run
 
 ```sh
-uv run github-actions-scan org ORG > report.tsv
-uv run github-actions-scan repo OWNER/REPO > updates.tsv
+uv run gh-external-audit org ORG > report.tsv
+uv run gh-external-audit repo OWNER/REPO > updates.tsv
 ```
 
-(Or equivalently `uv run python -m github_actions_scan ...`.)
+(Or equivalently `uv run python -m gh_external_audit ...`.)
 
 Flags common to both commands:
 
@@ -39,7 +39,7 @@ Flags common to both commands:
 
 ## Checks
 
-All checks live in `src/github_actions_scan/checks.py`. Each check is a
+All checks live in `src/gh_external_audit/checks.py`. Each check is a
 function that takes a parsed `action.yml` (a `dict`) and yields zero or more
 `ProblemRecord(code, detail)` values. The full list is `ACTION_CHECKS`, and
 `audit_action` fans out over it.

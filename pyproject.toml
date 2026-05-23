@@ -1,5 +1,5 @@
 [project]
-name = "github-actions-scan"
+name = "gh-external-audit"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -14,11 +14,11 @@ dependencies = [
 ]
 
 [project.scripts]
-github-actions-scan = "github_actions_scan.cli:app"
+gh-external-audit = "gh_external_audit.cli:app"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/github_actions_scan"]
+packages = ["src/gh_external_audit"]

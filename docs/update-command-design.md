@@ -12,10 +12,10 @@ commit and push the result as a PR.
 ## Shape
 
 ```
-github-actions-scan update OWNER/REPO            # default: interactive
-github-actions-scan update --here                # use cwd; infer OWNER/REPO from origin
-github-actions-scan update OWNER/REPO --emit     # print TSV; do not edit
-github-actions-scan update OWNER/REPO --decisions decisions.json
+gh-external-audit update OWNER/REPO            # default: interactive
+gh-external-audit update --here                # use cwd; infer OWNER/REPO from origin
+gh-external-audit update OWNER/REPO --emit     # print TSV; do not edit
+gh-external-audit update OWNER/REPO --decisions decisions.json
 ```
 
 Default end-to-end flow:
@@ -152,7 +152,7 @@ tiny even across many repos.
   ```
   title: Update GitHub Actions
   body:
-    Updates from `github-actions-scan update`:
+    Updates from `gh-external-audit update`:
 
     - actions/checkout: v4 → v6 (major tag)
     - actions/setup-python: main → v6 (major tag)
