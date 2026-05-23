@@ -80,7 +80,6 @@ def summarize_changes(
     """
     update_map = {(u.workflow_path, u.uses_target): u for u in updates}
     seen: dict[tuple[str, str, str], str] = {}
-    order: list[tuple[str, str, str]] = []
 
     for decision in decisions:
         if decision.choice == CHOICE_SKIP:
@@ -97,10 +96,9 @@ def summarize_changes(
         key = (update.uses_repo, update.current_ref, decision.choice)
         if key not in seen:
             seen[key] = new_ref
-            order.append(key)
 
     bullets = []
-    for key in order:
+    for key in sorted(seen, key=lambda k: (k[0].lower(), k[1].lower())):
         uses_repo, current_ref, choice = key
         new_ref = seen[key]
         kind = _CHOICE_LABELS.get(choice, choice)
