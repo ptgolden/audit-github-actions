@@ -1,5 +1,6 @@
 import json
 import sys
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import yaml
@@ -252,6 +253,39 @@ def scan_repo_workflows(
             workflow_file.path,
         )
         text = get_workflow_text(client, repo, workflow_file)
+        yield from parse_workflow(text, repo, workflow_file, should_skip_local)
+
+
+def scan_cloned_workflows(
+    clone_path: Path,
+    name_with_owner: str,
+) -> Iterable[UseRecord]:
+    """Read workflows from a local clone and yield uses of non-local actions.
+
+    The returned `UseRecord.workflow_path` is relative to the clone root (e.g.
+    `.github/workflows/test.yaml`), matching what the remote scan produces.
+    """
+    workflows_dir = clone_path / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        logger.warning(
+            "no .github/workflows directory in {}", clone_path
+        )
+        return
+
+    workflow_paths = sorted(
+        p for p in workflows_dir.iterdir()
+        if p.is_file() and p.suffix in {".yml", ".yaml"}
+    )
+    logger.debug(
+        "found {} workflow files in {}", len(workflow_paths), name_with_owner
+    )
+
+    repo = Repo(name_with_owner=name_with_owner, updated_at="", pushed_at="")
+    for path in workflow_paths:
+        relative = path.relative_to(clone_path).as_posix()
+        workflow_file = WorkflowFile(path=relative)
+        logger.debug("reading {}:{}", name_with_owner, relative)
+        text = path.read_text()
         yield from parse_workflow(text, repo, workflow_file, should_skip_local)
 
 

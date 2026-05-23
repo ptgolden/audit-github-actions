@@ -10,10 +10,10 @@ from .models import (
     UPDATE_REPORT_COLUMNS,
     ActionUpdate,
     LatestRelease,
-    Repo,
+    UseRecord,
 )
 from .releases import fetch_commit_info, fetch_latest_release
-from .scan import dedupe_scan_records, scan_repo_workflows
+from .scan import dedupe_scan_records
 
 
 STATUS_UP_TO_DATE = "up_to_date"
@@ -60,24 +60,26 @@ def compute_status(
 
 def find_action_updates(
     client: GitHubClient,
-    repo: Repo,
+    records: Iterable[UseRecord],
     progress: bool,
 ) -> list[ActionUpdate]:
-    """Scan a repo's workflows and look up release + current-pin info per action.
+    """Look up release + current-pin info per action for a stream of use records.
 
-    Looks up the latest release once per unique action repo, and the current
-    pin's commit info once per unique (repo, ref) pair.
+    Caches the latest-release lookup per unique action repo and the current
+    pin's commit info per unique (repo, ref) pair. The caller is responsible
+    for producing the records iterable from whatever source (remote scan,
+    local clone, etc.).
     """
-    records = dedupe_scan_records(scan_repo_workflows(client, repo))
+    deduped = dedupe_scan_records(records)
 
-    unique_repos = sorted({record.uses_repo for record in records if record.uses_repo})
+    unique_repos = sorted({record.uses_repo for record in deduped if record.uses_repo})
     unique_refs = sorted(
-        {(record.uses_repo, record.ref) for record in records if record.uses_repo and record.ref}
+        {(record.uses_repo, record.ref) for record in deduped if record.uses_repo and record.ref}
     )
     if progress:
         logger.info(
             "found {} workflow uses; {} unique action repos; {} unique pinned refs",
-            len(records),
+            len(deduped),
             len(unique_repos),
             len(unique_refs),
         )
@@ -125,7 +127,7 @@ def find_action_updates(
             current_bar.set_postfix_str(f"gh api calls={client.api_call_count}")
 
     updates: list[ActionUpdate] = []
-    for record in records:
+    for record in deduped:
         current_sha, current_date = current_by_ref.get(
             (record.uses_repo, record.ref), ("", "")
         )

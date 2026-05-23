@@ -1,13 +1,16 @@
 import sys
+from pathlib import Path
+from typing import Optional
 
 import typer
 from loguru import logger
 
 from .actions import action_keys_from_records, inspect_actions, metadata_records_by_key
+from .clone import ensure_clone, resolve_here, working_tree_is_dirty
 from .github import GitHubClient, require_gh
 from .models import Repo
 from .report import write_problem_report_from_records
-from .scan import dedupe_scan_records, scan
+from .scan import dedupe_scan_records, scan, scan_cloned_workflows, scan_repo_workflows
 from .update import find_action_updates, write_update_report
 
 
@@ -16,7 +19,8 @@ app = typer.Typer(
     help=(
         "Scan GitHub Actions workflow files. "
         "Use `org` to audit every repo in an organization, "
-        "or `repo` to find action updates for a single repository."
+        "`repo` to find action updates for a single repository, "
+        "or `update` to interactively update a repository's workflows."
     ),
 )
 
@@ -144,7 +148,110 @@ def repo_command(
     client = GitHubClient()
     try:
         repo_obj = Repo(name_with_owner=repo, updated_at="", pushed_at="")
-        updates = find_action_updates(client, repo_obj, progress)
+        records = scan_repo_workflows(client, repo_obj)
+        updates = find_action_updates(client, records, progress)
+        if progress:
+            logger.info("computed {} action update rows", len(updates))
+        write_update_report(updates, include_header=header)
+    finally:
+        if progress:
+            logger.info("gh api calls: {}", client.api_call_count)
+
+
+def _validate_owner_repo(value: str) -> str:
+    if "/" not in value or value.count("/") != 1 or not all(value.split("/")):
+        raise typer.BadParameter("repo must be in OWNER/REPO format")
+    return value
+
+
+@app.command(name="update")
+def update_command(
+    repo: Optional[str] = typer.Argument(
+        None,
+        help=(
+            "Target repository as OWNER/REPO. Required unless --here is set; "
+            "with --here, inferred from cwd's `origin` remote if omitted."
+        ),
+    ),
+    here: bool = typer.Option(
+        False,
+        "--here",
+        help="Operate on cwd instead of sparse-cloning. Infers OWNER/REPO from `origin`.",
+    ),
+    work_dir: Path = typer.Option(
+        Path("working"),
+        "--work-dir",
+        help="Directory under which sparse clones live. Ignored with --here.",
+    ),
+    force_reclone: bool = typer.Option(
+        False,
+        "--force-reclone",
+        help="Delete any existing clone before fetching. Ignored with --here.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the planned configuration without calling GitHub or editing files.",
+    ),
+    progress: bool = typer.Option(
+        True,
+        "--progress/--no-progress",
+        help="Write progress logs to stderr.",
+    ),
+    log_level: str = typer.Option(
+        "INFO",
+        "--log-level",
+        help="Log level for stderr progress logs.",
+    ),
+    header: bool = typer.Option(
+        True,
+        "--header/--no-header",
+        help="Include a TSV header row.",
+    ),
+) -> None:
+    """Interactively update GitHub Actions used in REPO's workflows.
+
+    Phase 1: sparse-clones (or uses cwd) and emits the same TSV as `repo`.
+    Interactive editing and PR creation land in later phases.
+    """
+    setup_logging(progress, log_level)
+
+    cwd = Path.cwd()
+    if here:
+        resolved_repo = repo if repo else resolve_here(cwd)
+        _validate_owner_repo(resolved_repo)
+        clone_path = cwd
+        if working_tree_is_dirty(clone_path):
+            logger.warning(
+                "{} has uncommitted changes; proceeding anyway (--here)", cwd
+            )
+    else:
+        if repo is None:
+            raise typer.BadParameter("OWNER/REPO required (or pass --here)")
+        resolved_repo = _validate_owner_repo(repo)
+        if dry_run:
+            clone_path = work_dir / resolved_repo
+        else:
+            clone_path = ensure_clone(resolved_repo, work_dir, force_reclone)
+
+    if dry_run:
+        typer.echo(f"repo: {resolved_repo}")
+        typer.echo(f"clone_path: {clone_path}")
+        typer.echo(f"here: {here}")
+        typer.echo(f"force_reclone: {force_reclone}")
+        typer.echo("planned steps:")
+        typer.echo("  ensure clone (or use cwd)")
+        typer.echo("  scan local workflows")
+        typer.echo("  fetch latest release per action repo")
+        typer.echo("  resolve current ref commit info per (repo, ref)")
+        typer.echo("  write update report")
+        return
+
+    require_gh()
+    client = GitHubClient()
+    try:
+        records = scan_cloned_workflows(clone_path, resolved_repo)
+        updates = find_action_updates(client, records, progress)
         if progress:
             logger.info("computed {} action update rows", len(updates))
         write_update_report(updates, include_header=header)
